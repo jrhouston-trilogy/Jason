@@ -8,6 +8,113 @@ import {
 import { MIC_DATA } from './data/micData';
 import { SITES_DATA } from './data/sitesData';
 
+const MOCK_ORDERS = [
+  {
+    id: 'ORD-2024-001',
+    siteId: 'PAL1',
+    siteName: 'Palo Alto',
+    date: '2024-12-15',
+    status: 'Delivered',
+    domain: 'SUPPLIES',
+    itemCount: 24,
+    total: 1250.50,
+    items: []
+  },
+  {
+    id: 'ORD-2024-002',
+    siteId: 'PIE1',
+    siteName: 'Piedmont',
+    date: '2024-12-10',
+    status: 'Shipped',
+    domain: 'FFE',
+    itemCount: 8,
+    total: 3240.00,
+    items: []
+  },
+  {
+    id: 'ORD-2024-003',
+    siteId: 'ROS-001',
+    siteName: 'Roswell',
+    date: '2024-12-01',
+    status: 'Approved',
+    domain: 'All',
+    itemCount: 42,
+    total: 5890.75,
+    items: []
+  },
+  {
+    id: 'ORD-2024-004',
+    siteId: 'PAL1',
+    siteName: 'Palo Alto',
+    date: '2024-11-20',
+    status: 'Delivered',
+    domain: 'SUPPLIES',
+    itemCount: 35,
+    total: 2150.25,
+    items: []
+  }
+];
+
+const parseASIN = (link) => {
+  if (!link || !link.includes('amazon.com')) return null;
+  const match = link.match(/\/dp\/([A-Z0-9]{10})|\/gp\/product\/([A-Z0-9]{10})/);
+  return match ? (match[1] || match[2]) : null;
+};
+
+const buildAmazonCartURLs = (items, maxPerBatch = 40) => {
+  const amazonItems = items
+    .filter(item => parseASIN(item.LINK) !== null)
+    .map(item => ({
+      asin: parseASIN(item.LINK),
+      quantity: item.quantity || 1,
+      name: item.ITEM_NAME,
+      price: item.UNIT_PRICE || 0,
+      link: item.LINK,
+    }));
+
+  const nonAmazonItems = items.filter(item => !parseASIN(item.LINK));
+
+  const batches = [];
+  for (let i = 0; i < amazonItems.length; i += maxPerBatch) {
+    const batch = amazonItems.slice(i, i + maxPerBatch);
+    const formFields = {};
+    batch.forEach((item, idx) => {
+      formFields[`ASIN.${idx + 1}`] = item.asin;
+      formFields[`Quantity.${idx + 1}`] = String(item.quantity);
+    });
+    batches.push({
+      formFields,
+      items: batch,
+      itemCount: batch.length,
+      estimatedTotal: batch.reduce((sum, i) => sum + (i.price * i.quantity), 0),
+    });
+  }
+
+  return {
+    batches,
+    totalAmazonItems: amazonItems.length,
+    nonAmazonItems,
+    totalBatches: batches.length,
+  };
+};
+
+const submitAmazonCart = (formFields) => {
+  const form = document.createElement('form');
+  form.method = 'GET';
+  form.action = 'https://www.amazon.com/gp/aws/cart/add.html';
+  form.target = '_blank';
+  Object.entries(formFields).forEach(([key, value]) => {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = key;
+    input.value = value;
+    form.appendChild(input);
+  });
+  document.body.appendChild(form);
+  form.submit();
+  document.body.removeChild(form);
+};
+
 export default function JasonApp() {
   const [currentPage, setCurrentPage] = useState('dashboard');
   const [selectedSite, setSelectedSite] = useState('PAL1');
