@@ -225,49 +225,112 @@ export default function JasonApp() {
   // CHAT HANDLER
   // ============================================================================
 
-  const handleChatSubmit = () => {
-    if (!chatInput.trim()) return;
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatHistory, setChatHistory] = useState([]);
 
-    const userMsg = chatInput.toLowerCase();
-    const newUserMessage = { id: chatMessages.length + 1, sender: 'user', text: chatInput };
+  const buildMICSummary = useCallback(() => {
+    const domains = {};
+    micItems.forEach(item => {
+      if (!domains[item.DOMAIN]) domains[item.DOMAIN] = { total: 0, withPrice: 0, withLink: 0, withVendor: 0, categories: {} };
+      domains[item.DOMAIN].total++;
+      if (item.UNIT_PRICE && item.UNIT_PRICE !== '') domains[item.DOMAIN].withPrice++;
+      if (item.LINK && item.LINK !== '') domains[item.DOMAIN].withLink++;
+      if (item.VENDOR && item.VENDOR !== '') domains[item.DOMAIN].withVendor++;
+      if (!domains[item.DOMAIN].categories[item.CATEGORY]) domains[item.DOMAIN].categories[item.CATEGORY] = 0;
+      domains[item.DOMAIN].categories[item.CATEGORY]++;
+    });
+    let summary = `Total items: ${micItems.length}\n`;
+    Object.entries(domains).forEach(([domain, data]) => {
+      summary += `\n${domain}: ${data.total} items (${data.withPrice} with price, ${data.withLink} with link, ${data.withVendor} with vendor)\n`;
+      summary += `Categories: ${Object.entries(data.categories).map(([c, n]) => `${c} (${n})`).join(', ')}\n`;
+    });
+    summary += `\nHealth: ${health.fullyCatalogued} fully catalogued, ${health.missingPrice} missing price, ${health.missingLink} missing link, ${health.missingVendor} missing vendor`;
+    return summary;
+  }, [micItems, health]);
+
+  const buildSitesSummary = useCallback(() => {
+    return SITES_DATA.map(s =>
+      `${s.site_name} (${s.site_id}): ${s.shipping_address}, Classrooms: WL=${s.wl_classrooms||0}, LL=${s.ll_classrooms||0}, L1=${s.l1_classrooms||0}, L2=${s.l2_classrooms||0}, Students/class: WL=${s.wl_students||0}, LL=${s.ll_students||0}, L1=${s.l1_students||0}, L2=${s.l2_students||0}`
+    ).join('\n');
+  }, []);
+
+  const executeActions = useCallback((actions) => {
+    actions.forEach(action => {
+      switch (action.type) {
+        case 'navigate':
+          if (['dashboard', 'order-builder', 'mic', 'sites', 'orders'].includes(action.value)) {
+            setCurrentPage(action.value);
+          }
+          break;
+        case 'select-site':
+          if (SITES_DATA.find(s => s.site_id === action.value)) {
+            setSelectedSite(action.value);
+          }
+          break;
+        case 'select-domain':
+          if (['All', 'SUPPLIES', 'FFE', 'CONSTRUCTION'].includes(action.value)) {
+            setSelectedDomain(action.value);
+          }
+          break;
+        case 'select-all':
+          // Handled by dispatching to Order Builder
+          break;
+        case 'clear-cart':
+          setCartItems([]);
+          break;
+      }
+    });
+  }, []);
+
+  const handleChatSubmit = async () => {
+    if (!chatInput.trim() || chatLoading) return;
+
+    const userText = chatInput;
+    const newUserMessage = { id: chatMessages.length + 1, sender: 'user', text: userText };
     setChatInput('');
-    setChatMessages([...chatMessages, newUserMessage]);
+    setChatMessages(prev => [...prev, newUserMessage]);
+    setChatLoading(true);
 
-    let responseText = '';
+    // Build conversation history for Claude
+    const newHistory = [...chatHistory, { role: 'user', content: userText }];
 
-    if (userMsg.includes('order') && userMsg.includes('for')) {
-      const siteWords = userMsg.split('for')[1].trim().split(/\s+/)[0];
-      const foundSite = SITES_DATA.find(s => s.site_name.toLowerCase().includes(siteWords.toLowerCase()));
-      if (foundSite) {
-        responseText = `I've prepared a supply order for ${foundSite.site_name}. Head to Order Builder to review and approve.`;
-        setSelectedSite(foundSite.site_id);
-        setCurrentPage('order-builder');
-      } else {
-        responseText = `I couldn't find a site matching "${siteWords}". Sites available: Palo Alto, Piedmont, Roswell.`;
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: newHistory,
+          micSummary: buildMICSummary(),
+          sitesData: buildSitesSummary(),
+          currentCart: cartItems,
+          currentPage: currentPage,
+        }),
+      });
+
+      if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+      const data = await response.json();
+
+      // Strip action tags from displayed message
+      const cleanMessage = data.message.replace(/\[ACTION:[\w-]*:?[\w-]*\]/g, '').trim();
+
+      setChatMessages(prev => [...prev, { id: prev.length + 1, sender: 'jason', text: cleanMessage }]);
+      setChatHistory([...newHistory, { role: 'assistant', content: data.message }]);
+
+      // Execute any actions Claude requested
+      if (data.actions && data.actions.length > 0) {
+        executeActions(data.actions);
       }
-    } else if (userMsg.includes('mic') || userMsg.includes('health')) {
-      responseText = `MIC Health Check: ${health.fullyCatalogued} of 307 items fully catalogued. ${health.missingPrice} missing prices, ${health.missingLink} missing links, ${health.missingVendor} missing vendors.`;
-    } else if ((userMsg.includes('cost') || userMsg.includes('how much')) && userMsg.includes('for')) {
-      const siteWords = userMsg.split('for')[1].trim();
-      const foundSite = SITES_DATA.find(s => s.site_name.toLowerCase().includes(siteWords.toLowerCase()));
-      if (foundSite) {
-        setSelectedSite(foundSite.site_id);
-        const suppliesForSite = MIC_DATA.filter(i => i.DOMAIN === 'SUPPLIES');
-        const totalCost = suppliesForSite.reduce((sum, item) => {
-          const price = parseFloat(item.UNIT_PRICE) || 0;
-          const qty = calculateQuantity(item);
-          return sum + (price * qty);
-        }, 0);
-        responseText = `Estimated supply cost for ${foundSite.site_name}: $${totalCost.toFixed(2)}`;
-      }
-    } else if (userMsg.includes('order') && (userMsg.includes('status') || userMsg.includes('what'))) {
-      const pendingOrders = orders.filter(o => o.status === 'Pending Review').length;
-      responseText = `You have ${pendingOrders} pending orders and ${orders.length - pendingOrders} completed orders.`;
-    } else {
-      responseText = "I'm not sure how to help with that yet. Try: 'order supplies for Roswell', 'mic health check', or 'cost for Palo Alto'";
+    } catch (error) {
+      console.error('Chat error:', error);
+      setChatMessages(prev => [...prev, {
+        id: prev.length + 1,
+        sender: 'jason',
+        text: `Connection issue — falling back to local mode. Try: "order supplies for Roswell", "mic health check", or "cost for Palo Alto".`
+      }]);
+    } finally {
+      setChatLoading(false);
     }
-
-    setChatMessages(prev => [...prev, { id: prev.length + 1, sender: 'jason', text: responseText }]);
   };
 
   // ============================================================================
@@ -1291,10 +1354,21 @@ export default function JasonApp() {
                       ? 'bg-[#1A5CB5] text-white rounded-br-none'
                       : 'bg-gray-300 text-gray-900 rounded-bl-none'
                   }`}>
-                    <p className="text-sm">{msg.text}</p>
+                    <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
                   </div>
                 </div>
               ))}
+              {chatLoading && (
+                <div className="flex justify-start">
+                  <div className="max-w-xs px-4 py-2 rounded-lg bg-gray-300 text-gray-900 rounded-bl-none">
+                    <p className="text-sm flex items-center gap-2">
+                      <span className="inline-block w-2 h-2 bg-gray-500 rounded-full animate-pulse"></span>
+                      <span className="inline-block w-2 h-2 bg-gray-500 rounded-full animate-pulse" style={{animationDelay: '0.2s'}}></span>
+                      <span className="inline-block w-2 h-2 bg-gray-500 rounded-full animate-pulse" style={{animationDelay: '0.4s'}}></span>
+                    </p>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="border-t p-4 bg-white rounded-b-lg flex gap-2">
               <input
@@ -1302,12 +1376,14 @@ export default function JasonApp() {
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyPress={(e) => e.key === 'Enter' && handleChatSubmit()}
-                placeholder="Ask me anything..."
-                className="flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                placeholder={chatLoading ? "Jason is thinking..." : "Ask me anything..."}
+                disabled={chatLoading}
+                className="flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm disabled:bg-gray-100"
               />
               <button
                 onClick={handleChatSubmit}
-                className="bg-[#1A5CB5] hover:bg-blue-700 text-white p-2 rounded transition"
+                disabled={chatLoading}
+                className="bg-[#1A5CB5] hover:bg-blue-700 disabled:bg-gray-400 text-white p-2 rounded transition"
               >
                 <Send size={18} />
               </button>
