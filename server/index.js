@@ -20,6 +20,27 @@ import {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ---- Health & config FIRST (open CORS — before restrictive middleware) ----
+app.get('/api/health', cors(), (req, res) => {
+  const sessions = getActiveSessions();
+  res.json({
+    status: 'ok',
+    service: 'jason-amazon-agent',
+    version: '1.0.0',
+    environment: process.env.RAILWAY_ENVIRONMENT || 'local',
+    activeSessions: sessions.length,
+    sessions,
+    uptime: Math.round(process.uptime()),
+  });
+});
+
+app.get('/api/config', cors(), (req, res) => {
+  res.json({
+    ready: !!(process.env.AMAZON_EMAIL && process.env.AMAZON_PASSWORD),
+    features: ['magic-mode', 'sse', '2fa-relay'],
+  });
+});
+
 // CORS: support multiple origins (comma-separated in ALLOWED_ORIGINS)
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || 'http://localhost:5173')
   .split(',')
@@ -66,27 +87,6 @@ function setupSSE(res) {
 
   return { sendEvent, onStatus };
 }
-
-// ---- Health & config (open CORS — no sensitive data) ----
-app.get('/api/health', cors(), (req, res) => {
-  const sessions = getActiveSessions();
-  res.json({
-    status: 'ok',
-    service: 'jason-amazon-agent',
-    version: '1.0.0',
-    environment: process.env.RAILWAY_ENVIRONMENT || 'local',
-    activeSessions: sessions.length,
-    sessions,
-    uptime: Math.round(process.uptime()),
-  });
-});
-
-app.get('/api/config', cors(), (req, res) => {
-  res.json({
-    ready: !!(process.env.AMAZON_EMAIL && process.env.AMAZON_PASSWORD),
-    features: ['magic-mode', 'sse', '2fa-relay'],
-  });
-});
 
 // ---- SSE: Start Amazon Order ----
 app.post('/api/amazon-order', (req, res) => {
