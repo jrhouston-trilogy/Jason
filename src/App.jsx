@@ -521,7 +521,10 @@ export default function JasonApp() {
 
     // ---- Agent / Magic Mode ordering state ----
     const LOCAL_AGENT_URL = 'http://localhost:3001';
-    const RAILWAY_API_URL = typeof import.meta !== 'undefined' && import.meta.env?.VITE_RAILWAY_API_URL || null;
+    const RAILWAY_API_URL = (() => {
+      const raw = typeof import.meta !== 'undefined' && import.meta.env?.VITE_RAILWAY_API_URL;
+      return raw ? raw.replace(/\/+$/, '') : null;
+    })();
 
     const [agentStatus, setAgentStatus] = useState(null);
     const [agentScreenshot, setAgentScreenshot] = useState(null);
@@ -536,11 +539,26 @@ export default function JasonApp() {
 
     // Check if Railway server is reachable on mount
     useEffect(() => {
-      if (!RAILWAY_API_URL) { setMagicAvailable(false); return; }
+      if (!RAILWAY_API_URL) {
+        console.warn('[Magic Mode] VITE_RAILWAY_API_URL not set — Magic Mode disabled');
+        setMagicAvailable(false);
+        return;
+      }
+      console.log('[Magic Mode] Checking Railway server:', RAILWAY_API_URL);
       fetch(`${RAILWAY_API_URL}/api/config`)
-        .then(r => r.json())
-        .then(d => setMagicAvailable(d.ready === true))
-        .catch(() => setMagicAvailable(false));
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+        .then(d => {
+          console.log('[Magic Mode] Server response:', d);
+          setMagicAvailable(d.ready === true);
+          if (!d.ready) console.warn('[Magic Mode] Server reachable but ready=false (AMAZON_EMAIL/PASSWORD not set on Railway)');
+        })
+        .catch(err => {
+          console.error('[Magic Mode] Failed to reach Railway server:', err.message);
+          setMagicAvailable(false);
+        });
     }, []);
 
     const resetAgentState = () => {

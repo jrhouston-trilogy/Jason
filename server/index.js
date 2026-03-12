@@ -67,8 +67,8 @@ function setupSSE(res) {
   return { sendEvent, onStatus };
 }
 
-// ---- Health check ----
-app.get('/api/health', (req, res) => {
+// ---- Health & config (open CORS — no sensitive data) ----
+app.get('/api/health', cors(), (req, res) => {
   const sessions = getActiveSessions();
   res.json({
     status: 'ok',
@@ -81,8 +81,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ---- Config check (frontend pings this to verify server is reachable) ----
-app.get('/api/config', (req, res) => {
+app.get('/api/config', cors(), (req, res) => {
   res.json({
     ready: !!(process.env.AMAZON_EMAIL && process.env.AMAZON_PASSWORD),
     features: ['magic-mode', 'sse', '2fa-relay'],
