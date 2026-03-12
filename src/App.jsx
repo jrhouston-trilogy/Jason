@@ -1,9 +1,10 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import {
   ShoppingCart, Package, MapPin, MessageSquare, BarChart3, Search,
   Check, AlertTriangle, ExternalLink, ChevronDown, ChevronRight, X,
   Send, Plus, Settings, Home, FileText, Truck, Edit3, Save, Trash2,
-  Filter, RefreshCw, AlertCircle, CheckCircle, XCircle, Eye, ArrowUpDown
+  Filter, RefreshCw, AlertCircle, CheckCircle, XCircle, Eye, ArrowUpDown,
+  Zap
 } from 'lucide-react';
 import { MIC_DATA } from './data/micData';
 import { SITES_DATA } from './data/sitesData';
@@ -518,6 +519,246 @@ export default function JasonApp() {
 
     const [showOrderModal, setShowOrderModal] = useState(false);
 
+    // ---- Agent / Magic Mode ordering state ----
+    const LOCAL_AGENT_URL = 'http://localhost:3001';
+    const RAILWAY_API_URL = typeof import.meta !== 'undefined' && import.meta.env?.VITE_RAILWAY_API_URL || null;
+
+    const [agentStatus, setAgentStatus] = useState(null);
+    const [agentScreenshot, setAgentScreenshot] = useState(null);
+    const [agentSessionId, setAgentSessionId] = useState(null);
+    const [agentError, setAgentError] = useState(null);
+    const [agentFailedItems, setAgentFailedItems] = useState([]);
+    const [agentItems, setAgentItems] = useState([]); // items sent to agent (for 2FA continue)
+    const [showAgentModal, setShowAgentModal] = useState(false);
+    const [agentMode, setAgentMode] = useState(null); // 'local' | 'magic'
+    const [magicAvailable, setMagicAvailable] = useState(null); // null=unchecked, true, false
+    const [twoFACode, setTwoFACode] = useState('');
+
+    // Check if Railway server is reachable on mount
+    useEffect(() => {
+      if (!RAILWAY_API_URL) { setMagicAvailable(false); return; }
+      fetch(`${RAILWAY_API_URL}/api/config`)
+        .then(r => r.json())
+        .then(d => setMagicAvailable(d.ready === true))
+        .catch(() => setMagicAvailable(false));
+    }, []);
+
+    const resetAgentState = () => {
+      setAgentStatus(null);
+      setAgentScreenshot(null);
+      setAgentSessionId(null);
+      setAgentError(null);
+      setAgentFailedItems([]);
+      setAgentItems([]);
+      setTwoFACode('');
+    };
+
+    const getAgentUrl = () => agentMode === 'magic' ? RAILWAY_API_URL : LOCAL_AGENT_URL;
+
+    // SSE helper: reads event-stream from agent server
+    const streamAgentSSE = async (url, body) => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'status') {
+                setAgentStatus({ phase: data.phase, message: data.message });
+              } else if (data.type === 'result') {
+                return data;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+      return null;
+    };
+
+    // Build the capped items list from cart
+    const buildAgentItems = () => {
+      const amazonItems = cartItems
+        .filter(item => parseASIN(item.LINK))
+        .map(item => ({
+          asin: parseASIN(item.LINK),
+          quantity: item.quantity || 1,
+          name: item.ITEM_NAME,
+          price: parseFloat(item.UNIT_PRICE) || 0,
+        }));
+
+      const itemsToSend = [];
+      let totalQty = 0;
+      for (const item of amazonItems) {
+        if (totalQty + item.quantity >= 100) break;
+        itemsToSend.push(item);
+        totalQty += item.quantity;
+      }
+
+      return { amazonItems, itemsToSend, totalQty, skippedCount: amazonItems.length - itemsToSend.length };
+    };
+
+    const startAgentOrder = async (mode) => {
+      resetAgentState();
+      setAgentMode(mode);
+      setShowAgentModal(true);
+
+      const baseUrl = mode === 'magic' ? RAILWAY_API_URL : LOCAL_AGENT_URL;
+      const { amazonItems, itemsToSend, totalQty, skippedCount } = buildAgentItems();
+
+      if (amazonItems.length === 0) {
+        setAgentError('No Amazon items with valid ASINs in cart.');
+        return;
+      }
+      if (itemsToSend.length === 0) {
+        setAgentError('First item quantity is >= 100. Reduce quantities to use agent ordering.');
+        return;
+      }
+
+      setAgentItems(itemsToSend);
+      const skippedMsg = skippedCount > 0 ? ` (${skippedCount} items deferred — qty limit)` : '';
+      const modeLabel = mode === 'magic' ? 'Magic Mode' : 'Local Agent';
+      setAgentStatus({ phase: 'starting', message: `${modeLabel}: starting for ${itemsToSend.length} items (${totalQty} total qty)${skippedMsg}...` });
+
+      try {
+        const result = await streamAgentSSE(`${baseUrl}/api/amazon-order`, { items: itemsToSend });
+
+        if (!result) {
+          setAgentError('Lost connection to agent server.');
+          return;
+        }
+
+        setAgentSessionId(result.sessionId);
+        if (result.screenshot) setAgentScreenshot(result.screenshot);
+
+        if (result.status === 'awaiting-approval') {
+          if (result.itemsFailed?.length > 0) setAgentFailedItems(result.itemsFailed);
+          setAgentStatus({ phase: 'awaiting-approval', message: result.itemsAdded != null ? `At checkout — ${result.itemsAdded} items in cart. Review and confirm.` : 'At checkout. Review the screenshot and confirm.' });
+        } else if (result.status === 'needs-intervention') {
+          setAgentStatus({
+            phase: result.reason,
+            message: result.reason === '2fa'
+              ? (mode === 'magic' ? 'Verification code required. Check your email and enter the code below.' : 'Verification required — complete it in the browser window, then click resume.')
+              : 'CAPTCHA detected — check the screenshot.',
+          });
+        } else if (result.status === 'error') {
+          setAgentError(result.reason);
+        }
+      } catch (err) {
+        const hint = mode === 'magic' ? 'Is the Railway server running?' : 'Is the local server running? (node server/index.js)';
+        setAgentError(`Could not connect to agent server. ${hint}`);
+      }
+    };
+
+    // Submit 2FA code remotely (Magic Mode)
+    const handleSubmit2FA = async () => {
+      if (!agentSessionId || !twoFACode.trim()) return;
+      const baseUrl = getAgentUrl();
+
+      setAgentStatus({ phase: '2fa-submitting', message: 'Submitting verification code...' });
+      setAgentError(null);
+
+      try {
+        const result = await streamAgentSSE(`${baseUrl}/api/amazon-order/2fa`, {
+          sessionId: agentSessionId,
+          code: twoFACode.trim(),
+        });
+
+        if (result?.screenshot) setAgentScreenshot(result.screenshot);
+        setTwoFACode('');
+
+        if (result?.status === '2fa-resolved') {
+          // 2FA passed — now continue with items
+          setAgentStatus({ phase: 'continuing', message: 'Verified! Now adding items to cart...' });
+          const contResult = await streamAgentSSE(`${baseUrl}/api/amazon-order/continue`, {
+            sessionId: agentSessionId,
+            items: agentItems,
+          });
+
+          if (contResult?.screenshot) setAgentScreenshot(contResult.screenshot);
+
+          if (contResult?.status === 'awaiting-approval') {
+            if (contResult.itemsFailed?.length > 0) setAgentFailedItems(contResult.itemsFailed);
+            setAgentStatus({ phase: 'awaiting-approval', message: contResult.itemsAdded != null ? `At checkout — ${contResult.itemsAdded} items in cart. Review and confirm.` : 'At checkout. Review and confirm.' });
+          } else if (contResult?.status === 'error') {
+            setAgentError(contResult.reason);
+          }
+        } else if (result?.status === 'needs-intervention') {
+          setAgentStatus({ phase: '2fa', message: 'Code may be incorrect. Check your email and try again.' });
+        } else if (result?.status === 'error') {
+          setAgentError(result.reason);
+        }
+      } catch (err) {
+        setAgentError(`Connection error: ${err.message}`);
+      }
+    };
+
+    // Resume after local browser intervention
+    const handleAgentResume = async () => {
+      if (!agentSessionId) return;
+      const baseUrl = getAgentUrl();
+      setAgentStatus({ phase: 'resuming', message: 'Checking browser state...' });
+
+      try {
+        const result = await streamAgentSSE(`${baseUrl}/api/amazon-order/resume`, { sessionId: agentSessionId });
+        if (result?.screenshot) setAgentScreenshot(result.screenshot);
+
+        if (result?.status === 'intervention-resolved') {
+          setAgentStatus({ phase: 'signed-in', message: 'Verified! You can now re-run the order.' });
+        } else if (result?.status === 'needs-intervention') {
+          setAgentStatus({ phase: '2fa', message: 'Still on verification page. Complete it in the browser, then try again.' });
+        }
+      } catch (err) {
+        setAgentError(`Connection error: ${err.message}`);
+      }
+    };
+
+    const handleAgentConfirmPurchase = async () => {
+      if (!agentSessionId) return;
+      const baseUrl = getAgentUrl();
+      setAgentStatus({ phase: 'placing-order', message: 'Placing order...' });
+
+      try {
+        const result = await streamAgentSSE(`${baseUrl}/api/amazon-order/confirm`, { sessionId: agentSessionId });
+        if (result?.screenshot) setAgentScreenshot(result.screenshot);
+
+        if (result?.status === 'order-placed') {
+          setAgentStatus({ phase: 'order-placed', message: 'Order placed successfully!' });
+        } else if (result?.status === 'error') {
+          setAgentError(result.reason);
+        }
+      } catch (err) {
+        setAgentError(`Connection error: ${err.message}`);
+      }
+    };
+
+    const handleAgentClose = async () => {
+      if (agentSessionId) {
+        try {
+          const baseUrl = getAgentUrl();
+          await fetch(`${baseUrl}/api/amazon-order/${agentSessionId}`, { method: 'DELETE' });
+        } catch (_) {}
+      }
+      resetAgentState();
+      setShowAgentModal(false);
+      setAgentMode(null);
+    };
+
     const handleApproveOrder = () => {
       if (cartItems.length === 0) return;
       setShowOrderModal(true);
@@ -863,19 +1104,209 @@ export default function JasonApp() {
                 </div>
               </div>
 
-              <div className="p-6 border-t border-gray-200 flex gap-3">
-                <button
-                  onClick={() => setShowOrderModal(false)}
-                  className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition"
-                >
-                  Back to Cart
-                </button>
-                <button
-                  onClick={confirmOrder}
-                  className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
-                >
-                  Confirm & Save Order
-                </button>
+              <div className="p-6 border-t border-gray-200 space-y-3">
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setShowOrderModal(false)}
+                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition"
+                  >
+                    Back to Cart
+                  </button>
+                  <button
+                    onClick={confirmOrder}
+                    className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
+                  >
+                    Confirm & Save Order
+                  </button>
+                </div>
+                {amazonCart && amazonCart.totalAmazonItems > 0 && (
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowOrderModal(false); startAgentOrder('local'); }}
+                      className="flex-1 px-4 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition flex items-center justify-center gap-2"
+                    >
+                      <Package size={16} />
+                      Local Agent
+                    </button>
+                    <button
+                      onClick={() => { setShowOrderModal(false); startAgentOrder('magic'); }}
+                      disabled={!magicAvailable}
+                      title={!magicAvailable ? (RAILWAY_API_URL ? 'Remote server unreachable' : 'Set VITE_RAILWAY_API_URL to enable') : 'Auto-order via remote server'}
+                      className={`flex-1 px-4 py-3 font-semibold rounded-lg transition flex items-center justify-center gap-2 ${
+                        magicAvailable
+                          ? 'bg-amber-500 hover:bg-amber-600 text-white'
+                          : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                      }`}
+                    >
+                      <Zap size={16} />
+                      Magic Mode
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* AGENT / MAGIC MODE ORDERING MODAL */}
+        {showAgentModal && (
+          <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-[60] p-4">
+            <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto">
+              <div className={`p-6 border-b ${agentMode === 'magic' ? 'border-amber-200 bg-amber-50' : 'border-gray-200'}`}>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                    {agentMode === 'magic' ? <Zap size={22} className="text-amber-500" /> : <Package size={22} className="text-purple-600" />}
+                    {agentMode === 'magic' ? 'Magic Mode' : 'Local Agent'}
+                  </h3>
+                  <button onClick={handleAgentClose} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
+                </div>
+                <p className="text-sm text-gray-500 mt-1">
+                  {agentMode === 'magic' ? 'Remote browser automation via Railway — review and approve before purchase' : 'Local browser automation — review and approve before purchase'}
+                </p>
+              </div>
+
+              <div className="p-6 space-y-4">
+                {/* Status Feed */}
+                {agentStatus && (
+                  <div className={`rounded-lg p-4 flex items-start gap-3 ${
+                    agentStatus.phase === 'error' ? 'bg-red-50 border border-red-200' :
+                    agentStatus.phase === 'order-placed' ? 'bg-green-50 border border-green-200' :
+                    agentStatus.phase === 'awaiting-approval' ? 'bg-amber-50 border border-amber-200' :
+                    agentStatus.phase === '2fa' || agentStatus.phase === 'captcha' || agentStatus.phase === '2fa-submitting' ? 'bg-orange-50 border border-orange-200' :
+                    'bg-blue-50 border border-blue-200'
+                  }`}>
+                    <div className="flex-shrink-0 mt-0.5">
+                      {agentStatus.phase === 'order-placed' ? <CheckCircle size={20} className="text-green-600" /> :
+                       agentStatus.phase === 'error' ? <XCircle size={20} className="text-red-600" /> :
+                       agentStatus.phase === 'awaiting-approval' ? <Eye size={20} className="text-amber-600" /> :
+                       agentStatus.phase === '2fa' || agentStatus.phase === 'captcha' ? <AlertCircle size={20} className="text-orange-600" /> :
+                       <RefreshCw size={20} className="text-blue-600 animate-spin" />}
+                    </div>
+                    <div>
+                      <p className="font-semibold text-sm text-gray-900 capitalize">{agentStatus.phase.replace(/-/g, ' ')}</p>
+                      <p className="text-sm text-gray-700 mt-0.5">{agentStatus.message}</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* 2FA Code Input (Magic Mode — remote, can't access browser) */}
+                {agentStatus?.phase === '2fa' && agentMode === 'magic' && (
+                  <div className="bg-orange-50 border border-orange-300 rounded-lg p-4">
+                    <p className="text-sm font-semibold text-orange-900 mb-2">Enter Verification Code</p>
+                    <p className="text-xs text-orange-700 mb-3">Check your email for a code from Amazon and enter it below.</p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={twoFACode}
+                        onChange={(e) => setTwoFACode(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleSubmit2FA()}
+                        placeholder="Enter code"
+                        className="flex-1 px-3 py-2 border border-orange-300 rounded-lg text-lg tracking-widest text-center font-mono focus:outline-none focus:ring-2 focus:ring-orange-400"
+                        autoFocus
+                      />
+                      <button
+                        onClick={handleSubmit2FA}
+                        disabled={!twoFACode.trim()}
+                        className="px-6 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-300 text-white font-semibold rounded-lg transition"
+                      >
+                        Submit Code
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Error */}
+                {agentError && (
+                  <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                    <p className="font-semibold text-red-800 text-sm flex items-center gap-2">
+                      <XCircle size={16} /> Error
+                    </p>
+                    <p className="text-sm text-red-700 mt-1">{agentError}</p>
+                  </div>
+                )}
+
+                {/* Failed Items */}
+                {agentFailedItems.length > 0 && (
+                  <div className="bg-orange-50 border border-orange-200 rounded-lg p-4">
+                    <h4 className="font-semibold text-orange-900 flex items-center gap-2 mb-2 text-sm">
+                      <AlertTriangle size={16} /> {agentFailedItems.length} item{agentFailedItems.length > 1 ? 's' : ''} could not be added
+                    </h4>
+                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                      {agentFailedItems.map((item, idx) => (
+                        <div key={idx} className="text-xs text-orange-800 flex justify-between">
+                          <span className="truncate flex-1">{item.name} (x{item.quantity})</span>
+                          <span className="text-orange-600 ml-2 flex-shrink-0">{item.reason}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Screenshot */}
+                {agentScreenshot && (
+                  <div className="border border-gray-200 rounded-lg overflow-hidden">
+                    <div className="bg-gray-100 px-3 py-2 text-xs font-semibold text-gray-600 uppercase tracking-wide">
+                      Browser Screenshot
+                    </div>
+                    <img
+                      src={`data:image/png;base64,${agentScreenshot}`}
+                      alt="Amazon checkout screenshot"
+                      className="w-full"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Action Buttons */}
+              <div className="p-6 border-t border-gray-200 space-y-3">
+                {agentStatus?.phase === 'awaiting-approval' && (
+                  <div className="flex gap-3">
+                    <button
+                      onClick={handleAgentClose}
+                      className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleAgentConfirmPurchase}
+                      className="flex-1 px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg transition text-lg"
+                    >
+                      Approve & Place Order
+                    </button>
+                  </div>
+                )}
+                {(agentStatus?.phase === '2fa' || agentStatus?.phase === 'captcha') && agentMode === 'local' && (
+                  <button
+                    onClick={handleAgentResume}
+                    className="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition"
+                  >
+                    I've Completed Verification — Resume
+                  </button>
+                )}
+                {agentStatus?.phase === 'order-placed' && (
+                  <button
+                    onClick={() => { handleAgentClose(); confirmOrder(); }}
+                    className="w-full px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg transition"
+                  >
+                    Save Order & Close
+                  </button>
+                )}
+                {agentStatus?.phase === 'signed-in' && (
+                  <button
+                    onClick={() => { handleAgentClose(); startAgentOrder(agentMode || 'local'); }}
+                    className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition"
+                  >
+                    Retry Order
+                  </button>
+                )}
+                {(agentError || (!agentStatus)) && (
+                  <button
+                    onClick={handleAgentClose}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition"
+                  >
+                    Close
+                  </button>
+                )}
               </div>
             </div>
           </div>
