@@ -41,11 +41,15 @@ app.get('/api/config', cors(), (req, res) => {
   });
 });
 
-// CORS: support multiple origins (comma-separated in ALLOWED_ORIGINS)
-const DEFAULT_ORIGINS = 'http://localhost:5173,https://jason-push.vercel.app';
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || DEFAULT_ORIGINS)
-  .split(',')
-  .map(o => o.trim());
+// CORS: always allow these origins + any from ALLOWED_ORIGINS env var
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://jason-push.vercel.app',
+  ...(process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean),
+];
 
 app.use(cors({
   origin: (origin, callback) => {
