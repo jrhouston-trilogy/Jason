@@ -42,7 +42,8 @@ app.get('/api/config', cors(), (req, res) => {
 });
 
 // CORS: support multiple origins (comma-separated in ALLOWED_ORIGINS)
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || 'http://localhost:5173')
+const DEFAULT_ORIGINS = 'http://localhost:5173,https://jason-push.vercel.app';
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || DEFAULT_ORIGINS)
   .split(',')
   .map(o => o.trim());
 
