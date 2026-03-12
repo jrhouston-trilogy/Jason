@@ -52,6 +52,21 @@ const BROWSER_ARGS = [
   '--disable-gpu',
   '--disable-software-rasterizer',
   '--disable-extensions',
+  '--js-flags=--max-old-space-size=256',
+  '--disable-canvas-aa',
+  '--disable-2d-canvas-clip-aa',
+  '--disable-accelerated-2d-canvas',
+  '--disable-default-apps',
+  '--disable-component-update',
+  '--disable-domain-reliability',
+  '--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process',
+  '--disable-hang-monitor',
+  '--disable-ipc-flooding-protection',
+  '--disable-renderer-backgrounding',
+  '--disable-background-networking',
+  '--metrics-recording-only',
+  '--mute-audio',
+  '--no-first-run',
 ];
 
 const CONTEXT_OPTIONS = {
@@ -290,6 +305,15 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
 async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
   const failedItems = [];
 
+  // Block heavy resources during add-to-cart to save memory on Railway
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     log(sessionId, `Adding item ${i + 1}/${items.length}: ${item.asin} qty=${item.quantity}`);
@@ -358,8 +382,9 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
       });
     }
 
-    // Human-like delay between items
+    // Flush page memory between items
     if (i < items.length - 1) {
+      await page.goto('about:blank', { waitUntil: 'commit' }).catch(() => {});
       await delay(800 + Math.random() * 700);
     }
 
@@ -374,6 +399,9 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
   });
 
   // ---- Go to cart, then checkout ----
+  // Unblock all resources for cart/checkout (need full page for screenshots)
+  await page.unroute('**/*');
+
   onStatus({ phase: 'checkout', message: 'Navigating to checkout...' });
   await page.goto('https://www.amazon.com/gp/cart/view.html', {
     waitUntil: 'domcontentloaded',
