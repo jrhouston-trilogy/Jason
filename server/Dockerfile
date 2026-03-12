@@ -11,12 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
+    libxfixes3 \
+    libxext6 \
+    libx11-6 \
+    libxcb1 \
     libgbm1 \
     libpango-1.0-0 \
     libcairo2 \
     libasound2 \
     libxshmfence1 \
     libx11-xcb1 \
+    libglib2.0-0 \
+    libdbus-1-3 \
+    libexpat1 \
     fonts-liberation \
     fonts-noto-color-emoji \
     dbus \
@@ -27,8 +34,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --production
 
-# Install Playwright Chromium browser
-RUN npx playwright install chromium
+# Install Playwright Chromium browser + any remaining system deps
+RUN npx playwright install --with-deps chromium
 
 COPY . .
 
