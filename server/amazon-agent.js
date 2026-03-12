@@ -1,12 +1,19 @@
 // Amazon Browser Automation Agent
 // Uses Playwright + Stealth to add items to cart and reach checkout
 // Supports both local (headless: false) and remote/Railway (headless: true) modes
+// Persists Amazon session cookies to skip login on subsequent orders
 
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 // Apply stealth plugin to avoid bot detection
 chromium.use(StealthPlugin());
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SESSION_FILE = path.join(__dirname, 'amazon-session.json');
 
 // Active sessions keyed by sessionId
 const sessions = new Map();
@@ -37,6 +44,169 @@ function touchSession(sessionId) {
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
 const HEADLESS = IS_PRODUCTION || process.env.HEADLESS === 'true';
 
+const BROWSER_ARGS = [
+  '--disable-blink-features=AutomationControlled',
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--disable-software-rasterizer',
+  '--disable-extensions',
+];
+
+const CONTEXT_OPTIONS = {
+  userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  viewport: { width: 1366, height: 768 },
+  locale: 'en-US',
+};
+
+// ---- Cookie persistence ----
+
+function loadSavedSession() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+      // Check if session file is less than 24 hours old
+      if (data.savedAt && Date.now() - data.savedAt < 24 * 60 * 60 * 1000) {
+        log(null, `Loaded saved session (${Math.round((Date.now() - data.savedAt) / 60000)} min old)`);
+        return data.storageState;
+      }
+      log(null, 'Saved session expired (>24h), will do fresh login');
+    }
+  } catch (e) {
+    log(null, `Failed to load saved session: ${e.message}`);
+  }
+  return null;
+}
+
+async function saveSession(context) {
+  try {
+    const storageState = await context.storageState();
+    fs.writeFileSync(SESSION_FILE, JSON.stringify({ storageState, savedAt: Date.now() }, null, 2));
+    log(null, 'Saved session cookies to amazon-session.json');
+  } catch (e) {
+    log(null, `Failed to save session: ${e.message}`);
+  }
+}
+
+// Check if we're actually logged in by navigating to Amazon homepage
+async function isLoggedIn(page, sessionId) {
+  try {
+    log(sessionId, 'Checking if saved session is still valid...');
+    await page.goto('https://www.amazon.com', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    await delay(2000);
+
+    const body = await page.content();
+    // Look for signs of being logged in
+    const signedIn = body.includes('nav-link-accountList') &&
+                     !body.includes('Sign in') ||
+                     body.includes('Hello, ') ||
+                     body.includes('nav-item-signout');
+
+    // Also check we're not on a login/verification page
+    const url = page.url();
+    const onLoginPage = url.includes('/ap/signin') || url.includes('/ap/cvf') || url.includes('/ap/mfa');
+
+    if (signedIn && !onLoginPage) {
+      log(sessionId, 'Saved session is valid — already logged in');
+      return true;
+    }
+
+    log(sessionId, 'Saved session expired or invalid');
+    return false;
+  } catch (e) {
+    log(sessionId, `Session check failed: ${e.message}`);
+    return false;
+  }
+}
+
+// Full login flow — returns true if signed in, or returns early result for 2FA/captcha
+async function doFullLogin({ page, email, password, sessionId, onStatus, context }) {
+  log(sessionId, 'Navigating to Amazon sign-in');
+  onStatus({ phase: 'signing-in', message: 'Navigating to Amazon sign-in...' });
+  await page.goto('https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0', {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000,
+  });
+  await delay(1500);
+
+  // Enter email
+  onStatus({ phase: 'signing-in', message: 'Entering email...' });
+  const emailField = await page.$('#ap_email');
+  if (emailField) {
+    await emailField.click();
+    await page.keyboard.type(email, { delay: 80 });
+    await delay(500);
+    await page.click('#continue');
+    await delay(2000);
+  }
+
+  // Check for CAPTCHA
+  const pageContent = await page.content();
+  if (pageContent.includes('captcha') || pageContent.includes('puzzle')) {
+    log(sessionId, 'CAPTCHA detected');
+    onStatus({ phase: 'captcha', message: 'CAPTCHA detected. Screenshot captured — please wait for manual resolution.' });
+    const screenshot = await page.screenshot({ type: 'png' });
+    sessions.get(sessionId).phase = 'captcha';
+    touchSession(sessionId);
+    return {
+      status: 'needs-intervention',
+      reason: 'captcha',
+      screenshot: screenshot.toString('base64'),
+      sessionId,
+    };
+  }
+
+  // Enter password
+  onStatus({ phase: 'signing-in', message: 'Entering password...' });
+  const passwordField = await page.$('#ap_password');
+  if (passwordField) {
+    await passwordField.click();
+    await page.keyboard.type(password, { delay: 60 });
+    await delay(500);
+    await page.click('#signInSubmit');
+    await delay(3000);
+  }
+
+  // Check for 2FA / verification
+  const currentUrl = page.url();
+  const body = await page.content();
+  const needs2FA = body.includes('verification') ||
+                   body.includes('Two-Step') ||
+                   body.includes('approve the notification') ||
+                   body.includes('Enter the characters') ||
+                   currentUrl.includes('/ap/cvf') ||
+                   currentUrl.includes('/ap/mfa');
+
+  if (needs2FA) {
+    log(sessionId, '2FA required, pausing for user input');
+    onStatus({
+      phase: '2fa',
+      message: 'Verification code required. Check your email and enter the code below.',
+    });
+    const screenshot = await page.screenshot({ type: 'png' });
+    sessions.get(sessionId).phase = '2fa';
+    touchSession(sessionId);
+    return {
+      status: 'needs-intervention',
+      reason: '2fa',
+      screenshot: screenshot.toString('base64'),
+      sessionId,
+    };
+  }
+
+  // Successfully signed in — save cookies
+  log(sessionId, 'Signed in successfully');
+  onStatus({ phase: 'signed-in', message: 'Signed in successfully.' });
+  await saveSession(context);
+  await delay(1000);
+
+  return { status: 'signed-in' };
+}
+
 export async function startAmazonOrder({ items, email, password, sessionId, onStatus }) {
   let browser = null;
   let context = null;
@@ -48,22 +218,17 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
 
     browser = await chromium.launch({
       headless: HEADLESS,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-extensions',
-      ],
+      args: BROWSER_ARGS,
     });
 
-    context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      viewport: { width: 1366, height: 768 },
-      locale: 'en-US',
-    });
+    // Try loading saved session cookies
+    const savedState = loadSavedSession();
+    if (savedState) {
+      onStatus({ phase: 'restoring-session', message: 'Restoring saved session...' });
+      context = await browser.newContext({ ...CONTEXT_OPTIONS, storageState: savedState });
+    } else {
+      context = await browser.newContext(CONTEXT_OPTIONS);
+    }
 
     page = await context.newPage();
 
@@ -71,84 +236,31 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
     sessions.set(sessionId, { browser, context, page, phase: 'starting', timeout: null });
     touchSession(sessionId);
 
-    // ---- STEP 1: Sign in ----
-    log(sessionId, 'Navigating to Amazon sign-in');
-    onStatus({ phase: 'signing-in', message: 'Navigating to Amazon sign-in...' });
-    await page.goto('https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
-    await delay(1500);
+    // ---- STEP 1: Sign in (or verify saved session) ----
+    let needsLogin = true;
 
-    // Enter email
-    onStatus({ phase: 'signing-in', message: 'Entering email...' });
-    const emailField = await page.$('#ap_email');
-    if (emailField) {
-      await emailField.click();
-      await page.keyboard.type(email, { delay: 80 });
-      await delay(500);
-      await page.click('#continue');
-      await delay(2000);
+    if (savedState) {
+      const valid = await isLoggedIn(page, sessionId);
+      if (valid) {
+        needsLogin = false;
+        onStatus({ phase: 'signed-in', message: 'Restored saved session — already signed in.' });
+      } else {
+        // Saved session invalid — create fresh context without cookies
+        log(sessionId, 'Saved session invalid, starting fresh login');
+        await context.close();
+        context = await browser.newContext(CONTEXT_OPTIONS);
+        page = await context.newPage();
+        sessions.set(sessionId, { ...sessions.get(sessionId), context, page });
+      }
     }
 
-    // Check for CAPTCHA
-    const pageContent = await page.content();
-    if (pageContent.includes('captcha') || pageContent.includes('puzzle')) {
-      log(sessionId, 'CAPTCHA detected');
-      onStatus({ phase: 'captcha', message: 'CAPTCHA detected. Screenshot captured — please wait for manual resolution.' });
-      const screenshot = await page.screenshot({ type: 'png' });
-      sessions.get(sessionId).phase = 'captcha';
-      touchSession(sessionId);
-      return {
-        status: 'needs-intervention',
-        reason: 'captcha',
-        screenshot: screenshot.toString('base64'),
-        sessionId,
-      };
+    if (needsLogin) {
+      const loginResult = await doFullLogin({ page, email, password, sessionId, onStatus, context });
+      if (loginResult.status !== 'signed-in') {
+        // 2FA or captcha — return early, caller will resume later
+        return loginResult;
+      }
     }
-
-    // Enter password
-    onStatus({ phase: 'signing-in', message: 'Entering password...' });
-    const passwordField = await page.$('#ap_password');
-    if (passwordField) {
-      await passwordField.click();
-      await page.keyboard.type(password, { delay: 60 });
-      await delay(500);
-      await page.click('#signInSubmit');
-      await delay(3000);
-    }
-
-    // Check for 2FA / verification
-    const currentUrl = page.url();
-    const body = await page.content();
-    const needs2FA = body.includes('verification') ||
-                     body.includes('Two-Step') ||
-                     body.includes('approve the notification') ||
-                     body.includes('Enter the characters') ||
-                     currentUrl.includes('/ap/cvf') ||
-                     currentUrl.includes('/ap/mfa');
-
-    if (needs2FA) {
-      log(sessionId, '2FA required, pausing for user input');
-      onStatus({
-        phase: '2fa',
-        message: 'Verification code required. Check your email and enter the code below.',
-      });
-      const screenshot = await page.screenshot({ type: 'png' });
-      sessions.get(sessionId).phase = '2fa';
-      touchSession(sessionId);
-      return {
-        status: 'needs-intervention',
-        reason: '2fa',
-        screenshot: screenshot.toString('base64'),
-        sessionId,
-      };
-    }
-
-    // Verify we're signed in
-    log(sessionId, 'Signed in successfully');
-    onStatus({ phase: 'signed-in', message: 'Signed in successfully.' });
-    await delay(1000);
 
     // ---- STEP 2: Add ALL items to cart ----
     return await addItemsAndCheckout({ items, page, sessionId, onStatus });
@@ -311,7 +423,7 @@ export async function confirmPurchase(sessionId, onStatus) {
     return { status: 'error', reason: 'Session not found — browser may have been closed.' };
   }
 
-  const { page } = session;
+  const { page, context } = session;
   touchSession(sessionId);
 
   try {
@@ -330,6 +442,9 @@ export async function confirmPurchase(sessionId, onStatus) {
       const confirmScreenshot = await page.screenshot({ type: 'png', fullPage: true });
       log(sessionId, 'Order placed successfully');
       onStatus({ phase: 'order-placed', message: 'Order placed successfully!' });
+
+      // Save cookies after successful order
+      await saveSession(context);
 
       await session.browser.close();
       clearTimeout(session.timeout);
@@ -369,7 +484,7 @@ export async function submit2FACode(sessionId, code, onStatus) {
     return { status: 'error', reason: 'Session not found.' };
   }
 
-  const { page } = session;
+  const { page, context } = session;
   touchSession(sessionId);
 
   try {
@@ -426,6 +541,10 @@ export async function submit2FACode(sessionId, code, onStatus) {
       log(sessionId, '2FA resolved, signed in');
       onStatus({ phase: 'signed-in', message: 'Verification complete. Signed in.' });
       sessions.get(sessionId).phase = 'signed-in';
+
+      // Save cookies after successful 2FA
+      await saveSession(context);
+
       return {
         status: '2fa-resolved',
         screenshot: screenshot.toString('base64'),
@@ -479,7 +598,7 @@ export async function resumeAfterIntervention(sessionId, onStatus) {
     return { status: 'error', reason: 'Session not found.' };
   }
 
-  const { page } = session;
+  const { page, context } = session;
   touchSession(sessionId);
 
   try {
@@ -494,6 +613,10 @@ export async function resumeAfterIntervention(sessionId, onStatus) {
         !currentUrl.includes('cvf')) {
       log(sessionId, 'Intervention resolved, signed in');
       onStatus({ phase: 'signed-in', message: 'Verification complete. Signed in.' });
+
+      // Save cookies after intervention resolved
+      await saveSession(context);
+
       return {
         status: 'intervention-resolved',
         screenshot: screenshot.toString('base64'),

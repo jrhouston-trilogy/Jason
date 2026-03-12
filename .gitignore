@@ -3,5 +3,7 @@ dist
 .env
 .env.local
 server/.env
+server/amazon-session.json
 *.log
 .DS_Store
+.vercel
