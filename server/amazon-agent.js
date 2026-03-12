@@ -251,6 +251,13 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
     sessions.set(sessionId, { browser, context, page, phase: 'starting', timeout: null });
     touchSession(sessionId);
 
+    // Auto-cleanup if browser crashes or disconnects
+    browser.on('disconnected', () => {
+      log(sessionId, 'Browser disconnected (crash or OOM) — cleaning up session');
+      clearTimeout(sessions.get(sessionId)?.timeout);
+      sessions.delete(sessionId);
+    });
+
     // ---- STEP 1: Sign in (or verify saved session) ----
     let needsLogin = true;
 

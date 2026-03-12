@@ -678,8 +678,14 @@ export default function JasonApp() {
           setAgentError(result.reason);
         }
       } catch (err) {
-        const hint = mode === 'magic' ? 'Is the Railway server running?' : 'Is the local server running? (node server/index.js)';
-        setAgentError(`Could not connect to agent server. ${hint}`);
+        console.error('[Agent] Error:', err);
+        if (agentStatus?.phase && agentStatus.phase !== 'starting') {
+          // We were already connected and receiving updates — stream died mid-flow
+          setAgentError(`Connection lost during ${agentStatus.phase}: ${err.message}. The browser may have crashed — try again.`);
+        } else {
+          const hint = mode === 'magic' ? 'Is the Railway server running?' : 'Is the local server running? (node server/index.js)';
+          setAgentError(`Could not connect to agent server. ${hint}`);
+        }
       }
     };
 
