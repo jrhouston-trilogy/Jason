@@ -104,7 +104,23 @@ async function saveSession(context) {
   }
 }
 
-// Check if we're actually logged in by navigating to Amazon homepage
+// Check if the current page indicates we're logged in (no navigation)
+function checkPageForLogin(url, body) {
+  const onLoginPage = url.includes('/ap/signin') || url.includes('/ap/cvf') ||
+                      url.includes('/ap/mfa') || url.includes('openid.') ||
+                      url.includes('/gp/sign-in');
+  if (onLoginPage) return false;
+
+  const hasSignedInIndicator =
+    (body.includes('nav-link-accountList') && !body.includes('>Sign in<')) ||
+    body.includes('Hello, ') ||
+    body.includes('nav-item-signout') ||
+    body.includes('#nav-al-your-account');
+
+  return hasSignedInIndicator;
+}
+
+// Navigate to Amazon and check if we're logged in
 async function isLoggedIn(page, sessionId) {
   try {
     log(sessionId, 'Checking if saved session is still valid...');
@@ -114,28 +130,26 @@ async function isLoggedIn(page, sessionId) {
     });
     await delay(2000);
 
-    const body = await page.content();
-    // Look for signs of being logged in
-    const signedIn = body.includes('nav-link-accountList') &&
-                     !body.includes('Sign in') ||
-                     body.includes('Hello, ') ||
-                     body.includes('nav-item-signout');
-
-    // Also check we're not on a login/verification page
     const url = page.url();
-    const onLoginPage = url.includes('/ap/signin') || url.includes('/ap/cvf') || url.includes('/ap/mfa');
+    const body = await page.content();
+    const loggedIn = checkPageForLogin(url, body);
 
-    if (signedIn && !onLoginPage) {
-      log(sessionId, 'Saved session is valid — already logged in');
-      return true;
-    }
-
-    log(sessionId, 'Saved session expired or invalid');
-    return false;
+    log(sessionId, loggedIn ? 'Saved session is valid — already logged in' : 'Saved session expired or invalid');
+    return loggedIn;
   } catch (e) {
     log(sessionId, `Session check failed: ${e.message}`);
     return false;
   }
+}
+
+// Quick check: are we still logged in? (call after navigating to a product page)
+async function isStillLoggedIn(page) {
+  const url = page.url();
+  if (url.includes('/ap/signin') || url.includes('/ap/cvf') ||
+      url.includes('/ap/mfa') || url.includes('/gp/sign-in')) {
+    return false;
+  }
+  return true;
 }
 
 // Full login flow — returns true if signed in, or returns early result for 2FA/captcha
@@ -284,6 +298,30 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
       }
     }
 
+    // ---- CRITICAL: Verify we're actually logged in before proceeding ----
+    log(sessionId, 'Verifying login state before adding items...');
+    onStatus({ phase: 'verifying-login', message: 'Verifying login...' });
+    await page.goto('https://www.amazon.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await delay(1500);
+    const verifyUrl = page.url();
+    const verifyBody = await page.content();
+    if (!checkPageForLogin(verifyUrl, verifyBody)) {
+      const screenshot = await page.screenshot({ type: 'png' });
+      log(sessionId, `NOT logged in after login flow! URL: ${verifyUrl}`);
+      // Delete stale session file
+      try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
+      onStatus({ phase: 'error', message: 'Login failed — Amazon did not accept the sign-in. Try again.' });
+      return {
+        status: 'error',
+        reason: 'Login verification failed — Amazon shows sign-in page after login attempt.',
+        screenshot: screenshot.toString('base64'),
+        sessionId,
+      };
+    }
+    log(sessionId, 'Login verified — proceeding to add items');
+    // Re-save cookies now that we've confirmed they work
+    await saveSession(context);
+
     // ---- STEP 2: Add ALL items to cart ----
     return await addItemsAndCheckout({ items, page, sessionId, onStatus });
 
@@ -377,6 +415,31 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
       });
       await delay(2000 + Math.random() * 1000);
 
+      // ---- CRITICAL: Check if Amazon logged us out mid-order ----
+      if (!(await isStillLoggedIn(page))) {
+        const screenshot = await page.screenshot({ type: 'png' });
+        const logoutUrl = page.url();
+        log(sessionId, `LOGGED OUT mid-order at item ${i + 1}! URL: ${logoutUrl}`);
+        // Invalidate saved session
+        try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
+
+        onStatus({
+          phase: 'logged-out',
+          message: `Amazon logged us out after ${i} items. Session expired — please restart the order.`,
+          screenshot: screenshot.toString('base64'),
+        });
+
+        // Return immediately — don't waste time on remaining items
+        return {
+          status: 'error',
+          reason: `Amazon logged out mid-order after ${i} items. Saved session invalidated — next attempt will do a fresh login.`,
+          screenshot: screenshot.toString('base64'),
+          sessionId,
+          itemsAdded: i - failedItems.length,
+          itemsFailed: failedItems,
+        };
+      }
+
       // Dismiss any overlays/modals that might block the button
       await page.evaluate(() => {
         // Close common Amazon popups
@@ -414,6 +477,27 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
       if (matched) {
         log(sessionId, `Clicked via: ${matched}`);
         await delay(2000 + Math.random() * 1000);
+
+        // Check if the click redirected us to sign-in (Amazon sometimes does this on ATC)
+        if (!(await isStillLoggedIn(page))) {
+          log(sessionId, `Logged out after ATC click on item ${i + 1}`);
+          try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
+          const screenshot = await page.screenshot({ type: 'png' });
+          onStatus({
+            phase: 'logged-out',
+            message: `Amazon logged us out when adding item ${i + 1}. Please restart.`,
+            screenshot: screenshot.toString('base64'),
+          });
+          return {
+            status: 'error',
+            reason: `Amazon logged out on Add to Cart click. Session invalidated.`,
+            screenshot: screenshot.toString('base64'),
+            sessionId,
+            itemsAdded: i - failedItems.length,
+            itemsFailed: failedItems,
+          };
+        }
+
         onStatus({
           phase: 'item-added',
           message: `Added ${i + 1}/${items.length}: ${item.name}`,
@@ -479,6 +563,22 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
     timeout: 30000,
   });
   await delay(2000);
+
+  // Check if cart page redirected to sign-in
+  if (!(await isStillLoggedIn(page))) {
+    const screenshot = await page.screenshot({ type: 'png' });
+    log(sessionId, 'Logged out when navigating to cart');
+    try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
+    onStatus({ phase: 'logged-out', message: 'Amazon logged us out at cart. Please restart.' });
+    return {
+      status: 'error',
+      reason: 'Amazon logged out at cart page. Session invalidated — next attempt will do fresh login.',
+      screenshot: screenshot.toString('base64'),
+      sessionId,
+      itemsAdded: addedCount,
+      itemsFailed: failedItems,
+    };
+  }
 
   // Click "Proceed to checkout"
   const checkoutBtn = await page.$('input[name="proceedToRetailCheckout"]') ||
