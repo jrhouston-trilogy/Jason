@@ -308,6 +308,47 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
   }
 }
 
+// Click an element via JavaScript to bypass Playwright's actionability checks
+// (avoids timeouts from overlays, interstitials, and modals)
+async function jsClick(page, selector) {
+  return page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center' });
+    el.click();
+    return true;
+  }, selector);
+}
+
+// Try multiple selectors to add to cart, using JS clicks
+async function tryAddToCart(page) {
+  const selectors = [
+    '#add-to-cart-button',
+    '#add-to-cart-button-ubb',
+    'input[name="submit.add-to-cart"]',
+    '[data-feature-id="addToCart"] button',
+    '#one-click-button',
+    '#buy-now-button',
+  ];
+
+  for (const sel of selectors) {
+    const clicked = await jsClick(page, sel);
+    if (clicked) return sel;
+  }
+
+  // Last resort: find by text content
+  const clicked = await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll('input[type="submit"], button, span.a-button-inner')];
+    const addBtn = buttons.find(b =>
+      (b.value || b.textContent || '').toLowerCase().includes('add to cart')
+    );
+    if (addBtn) { addBtn.click(); return true; }
+    return false;
+  });
+
+  return clicked ? 'text-match' : null;
+}
+
 // Extracted so it can be called after 2FA resolution
 async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
   const failedItems = [];
@@ -334,22 +375,30 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
       });
-      await delay(1500 + Math.random() * 1000);
+      await delay(2000 + Math.random() * 1000);
+
+      // Dismiss any overlays/modals that might block the button
+      await page.evaluate(() => {
+        // Close common Amazon popups
+        document.querySelectorAll(
+          '#sp-cc-accept, #attachSi498498_feature_div .a-button-close, ' +
+          '.a-popover-footer .a-button-close, #nav-main .nav-a.nav-a-2, ' +
+          '#abb-intl-popup .abb-intl-decline, .a-modal-close'
+        ).forEach(el => el.click());
+        // Remove overlay backdrops
+        document.querySelectorAll('.a-popover-wrapper, .a-modal-scroller').forEach(el => el.remove());
+      }).catch(() => {});
 
       // Set quantity if > 1
       if (item.quantity > 1) {
         try {
-          const qtySelect = await page.$('#quantity');
-          if (qtySelect) {
-            await qtySelect.selectOption(String(item.quantity));
-            await delay(500);
-          } else {
-            const qtyInput = await page.$('input[name="quantity"]');
-            if (qtyInput) {
-              await qtyInput.fill(String(item.quantity));
-              await delay(500);
-            }
-          }
+          await page.evaluate((qty) => {
+            const sel = document.querySelector('#quantity');
+            if (sel) { sel.value = String(qty); sel.dispatchEvent(new Event('change', { bubbles: true })); return; }
+            const inp = document.querySelector('input[name="quantity"]');
+            if (inp) { inp.value = String(qty); inp.dispatchEvent(new Event('input', { bubbles: true })); }
+          }, item.quantity);
+          await delay(500);
         } catch (e) {
           log(sessionId, `Qty set failed for ${item.asin}: ${e.message}`);
           onStatus({
@@ -359,33 +408,48 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
         }
       }
 
-      // Click "Add to Cart" — try multiple selectors
-      const addBtn = await page.$('#add-to-cart-button') ||
-                     await page.$('#add-to-cart-button-ubb') ||
-                     await page.$('input[name="submit.add-to-cart"]') ||
-                     await page.$('[data-feature-id="addToCart"] button');
+      // Try Add to Cart via JS click
+      const matched = await tryAddToCart(page);
 
-      if (addBtn) {
-        await addBtn.click();
+      if (matched) {
+        log(sessionId, `Clicked via: ${matched}`);
         await delay(2000 + Math.random() * 1000);
         onStatus({
           phase: 'item-added',
           message: `Added ${i + 1}/${items.length}: ${item.name}`,
         });
       } else {
-        failedItems.push({ ...item, reason: 'no Add to Cart button' });
-        log(sessionId, `No add-to-cart button for ${item.asin}`);
+        // Capture screenshot of failed page for debugging
+        let failScreenshot = null;
+        try {
+          const buf = await page.screenshot({ type: 'png' });
+          failScreenshot = buf.toString('base64');
+        } catch (_) {}
+
+        const pageUrl = page.url();
+        failedItems.push({ ...item, reason: 'no Add to Cart button found' });
+        log(sessionId, `No add-to-cart button for ${item.asin}, url: ${pageUrl}`);
         onStatus({
           phase: 'item-skipped',
           message: `Skipped ${item.name} — no Add to Cart button found.`,
+          screenshot: failScreenshot,
+          url: pageUrl,
         });
       }
     } catch (err) {
+      // Capture screenshot on error
+      let failScreenshot = null;
+      try {
+        const buf = await page.screenshot({ type: 'png' });
+        failScreenshot = buf.toString('base64');
+      } catch (_) {}
+
       failedItems.push({ ...item, reason: err.message });
       log(sessionId, `Error adding ${item.asin}: ${err.message}`);
       onStatus({
         phase: 'item-skipped',
         message: `Skipped ${item.name} — ${err.message}`,
+        screenshot: failScreenshot,
       });
     }
 
