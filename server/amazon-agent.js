@@ -18,8 +18,8 @@ const SESSION_FILE = path.join(__dirname, 'amazon-session.json');
 // Active sessions keyed by sessionId
 const sessions = new Map();
 
-// Session timeout: 5 minutes of inactivity
-const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
+// Session timeout: 10 minutes of inactivity (user needs time to review checkout)
+const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
 function log(sessionId, ...args) {
   const ts = new Date().toISOString();
@@ -323,7 +323,7 @@ export async function startAmazonOrder({ items, email, password, sessionId, onSt
     await saveSession(context);
 
     // ---- STEP 2: Add ALL items to cart ----
-    return await addItemsAndCheckout({ items, page, sessionId, onStatus });
+    return await addItemsAndCheckout({ items, page, context, email, password, sessionId, onStatus });
 
   } catch (error) {
     let screenshot = null;
@@ -388,7 +388,7 @@ async function tryAddToCart(page) {
 }
 
 // Extracted so it can be called after 2FA resolution
-async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
+async function addItemsAndCheckout({ items, page, context, email, password, sessionId, onStatus }) {
   const failedItems = [];
 
   // Block heavy resources during add-to-cart to save memory on Railway
@@ -557,30 +557,48 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
   // Unblock all resources for cart/checkout (need full page for screenshots)
   await page.unroute('**/*');
 
-  onStatus({ phase: 'checkout', message: 'Navigating to checkout...' });
+  // Helper: attempt to re-login if Amazon kicks us to sign-in
+  const reLoginIfNeeded = async (phase) => {
+    if (await isStillLoggedIn(page)) return true;
+
+    log(sessionId, `Logged out at ${phase} — attempting re-login`);
+    onStatus({ phase: 're-login', message: `Amazon requires re-authentication at ${phase}. Logging in again...` });
+    try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
+
+    // Do the full login flow on the current page (Amazon already redirected us to sign-in)
+    const loginResult = await doFullLogin({ page, email, password, sessionId, onStatus, context });
+    if (loginResult.status !== 'signed-in') {
+      // 2FA needed during re-login — can't auto-recover, return the intervention result
+      return loginResult;
+    }
+
+    log(sessionId, `Re-login successful at ${phase}`);
+    await saveSession(context);
+    return true;
+  };
+
+  // Navigate to cart
+  onStatus({ phase: 'checkout', message: 'Navigating to cart...' });
   await page.goto('https://www.amazon.com/gp/cart/view.html', {
     waitUntil: 'domcontentloaded',
     timeout: 30000,
   });
   await delay(2000);
 
-  // Check if cart page redirected to sign-in
-  if (!(await isStillLoggedIn(page))) {
-    const screenshot = await page.screenshot({ type: 'png' });
-    log(sessionId, 'Logged out when navigating to cart');
-    try { fs.unlinkSync(SESSION_FILE); } catch (_) {}
-    onStatus({ phase: 'logged-out', message: 'Amazon logged us out at cart. Please restart.' });
-    return {
-      status: 'error',
-      reason: 'Amazon logged out at cart page. Session invalidated — next attempt will do fresh login.',
-      screenshot: screenshot.toString('base64'),
-      sessionId,
-      itemsAdded: addedCount,
-      itemsFailed: failedItems,
-    };
+  // Check if cart page redirected to sign-in — re-login and retry
+  const cartLoginResult = await reLoginIfNeeded('cart');
+  if (cartLoginResult !== true) return cartLoginResult; // 2FA intervention needed
+  // If we re-logged in, navigate to cart again
+  if (page.url().includes('/ap/') || !page.url().includes('cart')) {
+    await page.goto('https://www.amazon.com/gp/cart/view.html', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    await delay(2000);
   }
 
   // Click "Proceed to checkout"
+  onStatus({ phase: 'checkout', message: 'Proceeding to checkout...' });
   const checkoutBtn = await page.$('input[name="proceedToRetailCheckout"]') ||
                       await page.$('#sc-buy-box-ptc-button input') ||
                       await page.$('[data-feature-id="proceed-to-checkout-action"] a');
@@ -595,11 +613,53 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
     }
   }
 
+  // Check if "Proceed to checkout" kicked us to sign-in — re-login and retry
+  const checkoutLoginResult = await reLoginIfNeeded('checkout');
+  if (checkoutLoginResult !== true) return checkoutLoginResult;
+  // If we re-logged in, go back to cart and try checkout again
+  if (page.url().includes('/ap/') || page.url().includes('/gp/sign-in')) {
+    log(sessionId, 'Re-navigating to cart after re-login at checkout');
+    await page.goto('https://www.amazon.com/gp/cart/view.html', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    await delay(2000);
+    const retryBtn = await page.$('input[name="proceedToRetailCheckout"]') ||
+                     await page.$('#sc-buy-box-ptc-button input') ||
+                     await page.$('[data-feature-id="proceed-to-checkout-action"] a') ||
+                     await page.$('text=Proceed to checkout');
+    if (retryBtn) {
+      await retryBtn.click();
+      await delay(5000);
+    }
+  }
+
+  // Final check: are we actually on a checkout page?
+  const finalUrl = page.url();
+  const finalBody = await page.content();
+  const onCheckout = finalUrl.includes('checkout') || finalUrl.includes('buy') ||
+                     finalBody.includes('Place your order') || finalBody.includes('placeYourOrder') ||
+                     finalBody.includes('Shipping address') || finalBody.includes('Payment method');
+
+  if (!onCheckout) {
+    const screenshot = await page.screenshot({ type: 'png', fullPage: true });
+    log(sessionId, `Not on checkout page after all attempts. URL: ${finalUrl}`);
+    onStatus({ phase: 'error', message: 'Could not reach checkout page. Check the screenshot.' });
+    return {
+      status: 'error',
+      reason: `Could not reach checkout. Final URL: ${finalUrl}`,
+      screenshot: screenshot.toString('base64'),
+      sessionId,
+      itemsAdded: addedCount,
+      itemsFailed: failedItems,
+    };
+  }
+
   // Screenshot checkout page
   const failedMsg = failedItems.length > 0
     ? ` (${failedItems.length} item${failedItems.length > 1 ? 's' : ''} could not be added)`
     : '';
-  log(sessionId, 'At checkout, awaiting approval');
+  log(sessionId, `At checkout, awaiting approval. URL: ${finalUrl}`);
   onStatus({ phase: 'awaiting-approval', message: `At checkout — ${addedCount} items in cart${failedMsg}. Review and confirm.` });
   const checkoutScreenshot = await page.screenshot({ type: 'png', fullPage: true });
 
@@ -610,7 +670,7 @@ async function addItemsAndCheckout({ items, page, sessionId, onStatus }) {
     status: 'awaiting-approval',
     screenshot: checkoutScreenshot.toString('base64'),
     sessionId,
-    currentUrl: page.url(),
+    currentUrl: finalUrl,
     itemsAdded: addedCount,
     itemsFailed: failedItems,
   };
@@ -777,7 +837,9 @@ export async function continueAfter2FA(sessionId, items, onStatus) {
   log(sessionId, `Continuing order after 2FA: ${items.length} items`);
 
   try {
-    return await addItemsAndCheckout({ items, page: session.page, sessionId, onStatus });
+    const email = process.env.AMAZON_EMAIL;
+    const password = process.env.AMAZON_PASSWORD;
+    return await addItemsAndCheckout({ items, page: session.page, context: session.context, email, password, sessionId, onStatus });
   } catch (error) {
     let screenshot = null;
     try {
